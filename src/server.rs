@@ -16,6 +16,24 @@ use std::sync::mpsc::TrySendError;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 
+use crate::graph_visualizer::GraphVisualizer;
+use crate::safe_db::db::DB;
+
+use crate::graph_new::graph::FlowGraph;
+use crate::graph_new::graph_analytics::GraphAnalytics;
+use crate::graph_new::network_flow::{NetworkFlow, NetworkFlowAlgorithm};
+use crate::graph_new::ford_fulkerson::FordFulkerson;
+use crate::graph_new::capacity_scaling::CapacityScaling;
+use crate::graph_new::path_search::PathSearchAlgorithm;
+use crate::graph_new::flow_recorder::FlowRecorder;
+use crate::graph_new::dinic::DinicsAlgorithm;
+use crate::graph_new::push_relabel::PushRelabelAlgorithm;
+
+struct LoadedGraphData {
+    edge_db: Arc<EdgeDB>,
+    flow_graph: Arc<Mutex<FlowGraph>>,
+}
+
 struct JsonRpcRequest {
     id: JsonValue,
     method: String,
@@ -69,16 +87,16 @@ fn validate_and_parse_u256(value_str: &str) -> Result<U256, Box<dyn Error>> {
 }
 
 pub fn start_server(listen_at: &str, queue_size: usize, threads: u64) {
-    let edges: Arc<RwLock<Arc<EdgeDB>>> = Arc::new(RwLock::new(Arc::new(EdgeDB::default())));
+    let loaded_data: Arc<RwLock<Option<LoadedGraphData>>> = Arc::new(RwLock::new(None));
 
     let (sender, receiver) = mpsc::sync_channel(queue_size);
     let protected_receiver = Arc::new(Mutex::new(receiver));
     for _ in 0..threads {
         let rec = protected_receiver.clone();
-        let e = edges.clone();
+        let data = loaded_data.clone();
         thread::spawn(move || loop {
             let socket = rec.lock().unwrap().recv().unwrap();
-            if let Err(e) = handle_connection(e.deref(), socket) {
+            if let Err(e) = handle_connection(data.deref(), socket) {
                 println!("Error handling connection: {e}");
             }
         });
@@ -101,13 +119,13 @@ pub fn start_server(listen_at: &str, queue_size: usize, threads: u64) {
 }
 
 fn handle_connection(
-    edges: &RwLock<Arc<EdgeDB>>,
+    loaded_data: &RwLock<Option<LoadedGraphData>>,
     mut socket: TcpStream,
 ) -> Result<(), Box<dyn Error>> {
     let request = read_request(&mut socket)?;
     match request.method.as_str() {
         "load_edges_binary" => {
-            let response = match load_edges_binary(edges, &request.params["file"].to_string()) {
+            let response = match load_edges_binary(loaded_data, &request.params["file"].to_string()) {
                 Ok(len) => jsonrpc_response(request.id, len),
                 Err(e) => {
                     jsonrpc_error_response(request.id, -32000, &format!("Error loading edges: {e}"))
@@ -116,7 +134,7 @@ fn handle_connection(
             socket.write_all(response.as_bytes())?;
         }
         "load_edges_csv" => {
-            let response = match load_edges_csv(edges, &request.params["file"].to_string()) {
+            let response = match load_edges_csv(loaded_data, &request.params["file"].to_string()) {
                 Ok(len) => jsonrpc_response(request.id, len),
                 Err(e) => {
                     jsonrpc_error_response(request.id, -32000, &format!("Error loading edges: {e}"))
@@ -125,7 +143,7 @@ fn handle_connection(
             socket.write_all(response.as_bytes())?;
         }
         "load_safes_binary" => {
-            let response = match load_safes_binary(edges, &request.params["file"].to_string()) {
+            let response = match load_safes_binary(loaded_data, &request.params["file"].to_string()) {
                 Ok(len) => jsonrpc_response(request.id, len),
                 Err(e) => {
                     jsonrpc_error_response(request.id, -32000, &format!("Error loading edges: {e}"))
@@ -134,19 +152,138 @@ fn handle_connection(
             socket.write_all(response.as_bytes())?;
         }
         "compute_transfer" => {
-            println!("Computing flow");
-            let e = edges.read().unwrap().clone();
-            compute_transfer(request, e.as_ref(), socket)?;
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                compute_transfer(request, &data.edge_db, socket)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
         }
+        "compute_FordFulkerson" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                generic_compute_transfer_new(&request, &data.edge_db, &data.flow_graph, socket, FordFulkerson)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        }
+        "compute_CapacityScaling" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                generic_compute_transfer_new(&request, &data.edge_db, &data.flow_graph, socket, CapacityScaling)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        }
+        "compute_Dinic" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                generic_compute_transfer_new(&request, &data.edge_db, &data.flow_graph, socket, DinicsAlgorithm)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        }
+        "compute_PushRelabel" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                generic_compute_transfer_new(&request, &data.edge_db, &data.flow_graph, socket, PushRelabelAlgorithm)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        }
+        "visualize_flow_graph_FordFulkerson" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                let response = generic_visualize_flow_graph_new(&data.edge_db, &data.flow_graph, &request.params, FordFulkerson)?;
+                socket.write_all(jsonrpc_response(request.id, response).as_bytes())?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        },
+        "visualize_flow_graph_CapacityScaling" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                let response = generic_visualize_flow_graph_new(&data.edge_db, &data.flow_graph, &request.params, CapacityScaling)?;
+                socket.write_all(jsonrpc_response(request.id, response).as_bytes())?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        },
+        "visualize_flow_graph_Dinic" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                let response = generic_visualize_flow_graph_new(&data.edge_db, &data.flow_graph, &request.params, DinicsAlgorithm)?;
+                socket.write_all(jsonrpc_response(request.id, response).as_bytes())?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        },
+        "visualize_flow_graph_PushRelabel" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                let response = generic_visualize_flow_graph_new(&data.edge_db, &data.flow_graph, &request.params, PushRelabelAlgorithm)?;
+                socket.write_all(jsonrpc_response(request.id, response).as_bytes())?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        },
+        "compute_FordFulkerson_with_visualization" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                compute_transfer_with_visualization(&request, &data.edge_db, &data.flow_graph, socket, FordFulkerson)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        }
+        "compute_CapacityScaling_with_visualization" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                compute_transfer_with_visualization(&request, &data.edge_db, &data.flow_graph, socket, CapacityScaling)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        }
+        "compute_Dinic_with_visualization" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                compute_transfer_with_visualization(&request, &data.edge_db, &data.flow_graph, socket, DinicsAlgorithm)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        }
+        "compute_PushRelabel_with_visualization" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                compute_transfer_with_visualization(&request, &data.edge_db, &data.flow_graph, socket, PushRelabelAlgorithm)?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        }
+        "visualize_flow_graph" => {
+            let data = loaded_data.read().unwrap();
+            if let Some(ref data) = *data {
+                let response = generic_visualize_flow_graph(&data.edge_db, &request.params, graph::compute_flow)?;
+                socket.write_all(jsonrpc_response(request.id, response).as_bytes())?;
+            } else {
+                socket.write_all(jsonrpc_error_response(request.id, -32000, "No data loaded").as_bytes())?;
+            }
+        },
         "update_edges" => {
             let response = match request.params {
-                JsonValue::Array(updates) => match update_edges(edges, updates) {
-                    Ok(len) => jsonrpc_response(request.id, len),
-                    Err(e) => jsonrpc_error_response(
-                        request.id,
-                        -32000,
-                        &format!("Error updating edges: {e}"),
-                    ),
+                JsonValue::Array(updates) => {
+                    let mut data = loaded_data.write().unwrap();
+                    if let Some(ref mut data) = *data {
+                        match update_edges(&mut data.edge_db, &mut data.flow_graph, updates) {
+                            Ok(len) => jsonrpc_response(request.id, len),
+                            Err(e) => jsonrpc_error_response(
+                                request.id,
+                                -32000,
+                                &format!("Error updating edges: {e}"),
+                            ),
+                        }
+                    } else {
+                        jsonrpc_error_response(request.id, -32000, "No data loaded")
+                    }
                 },
                 _ => {
                     jsonrpc_error_response(request.id, -32602, "Invalid arguments: Expected array.")
@@ -160,26 +297,46 @@ fn handle_connection(
     Ok(())
 }
 
-fn load_edges_binary(edges: &RwLock<Arc<EdgeDB>>, file: &String) -> Result<usize, Box<dyn Error>> {
-    let updated_edges = read_edges_binary(file)?;
-    let len = updated_edges.edge_count();
-    *edges.write().unwrap() = Arc::new(updated_edges);
+fn load_edges_binary(loaded_data: &RwLock<Option<LoadedGraphData>>, file: &str) -> Result<usize, Box<dyn Error>> {
+    let db = import_from_safes_binary(file)?;
+    let edge_db = Arc::new(db.edges().clone());
+    let flow_graph = Arc::new(Mutex::new(edge_db_to_flow_graph(edge_db.clone(), &db)));
+    let len = edge_db.edge_count();
+    
+    let mut data = loaded_data.write().unwrap();
+    *data = Some(LoadedGraphData {
+        edge_db,
+        flow_graph,
+    });
+    
     Ok(len)
 }
 
-fn load_edges_csv(edges: &RwLock<Arc<EdgeDB>>, file: &String) -> Result<usize, Box<dyn Error>> {
-    let updated_edges = read_edges_csv(file)?;
+fn load_edges_csv(loaded_data: &RwLock<Option<LoadedGraphData>>, file: &str) -> Result<usize, Box<dyn Error>> {
+    let updated_edges = Arc::new(read_edges_csv(&file.to_string())?);
     let len = updated_edges.edge_count();
-    *edges.write().unwrap() = Arc::new(updated_edges);
+    let flow_graph = Arc::new(Mutex::new(edge_db_to_flow_graph(updated_edges.clone(), &DB::default())));
+    let mut data = loaded_data.write().unwrap();
+    *data = Some(LoadedGraphData {
+        edge_db: updated_edges,
+        flow_graph,
+    });
     Ok(len)
 }
 
-fn load_safes_binary(edges: &RwLock<Arc<EdgeDB>>, file: &str) -> Result<usize, Box<dyn Error>> {
-    let updated_edges = import_from_safes_binary(file)?.edges().clone();
+fn load_safes_binary(loaded_data: &RwLock<Option<LoadedGraphData>>, file: &str) -> Result<usize, Box<dyn Error>> {
+    let db = import_from_safes_binary(file)?;
+    let updated_edges = Arc::new(db.edges().clone());
     let len = updated_edges.edge_count();
-    *edges.write().unwrap() = Arc::new(updated_edges);
+    let flow_graph = Arc::new(Mutex::new(edge_db_to_flow_graph(updated_edges.clone(), &db)));
+    let mut data = loaded_data.write().unwrap();
+    *data = Some(LoadedGraphData {
+        edge_db: updated_edges,
+        flow_graph,
+    });
     Ok(len)
 }
+
 
 fn compute_transfer(
     request: JsonRpcRequest,
@@ -212,7 +369,7 @@ fn compute_transfer(
             max_distance,
             max_transfers,
         );
-        println!("Computed flow with max distance {max_distance:?}: {flow}");
+        println!("Computed flow with max distance {max_distance:?}: {}",flow.to_decimal());
         socket.write_all(
             chunked_response(
                 &(jsonrpc_result(
@@ -236,8 +393,10 @@ fn compute_transfer(
     Ok(())
 }
 
+
 fn update_edges(
-    edges: &RwLock<Arc<EdgeDB>>,
+    edge_db: &mut Arc<EdgeDB>,
+    flow_graph: &Arc<Mutex<FlowGraph>>,
     updates: Vec<JsonValue>,
 ) -> Result<usize, Box<dyn Error>> {
     let updates = updates
@@ -250,15 +409,17 @@ fn update_edges(
         })
         .collect::<Vec<_>>();
     if updates.is_empty() {
-        return Ok(edges.read().unwrap().edge_count());
+        return Ok(edge_db.edge_count());
     }
 
-    let mut updating_edges = edges.read().unwrap().as_ref().clone();
-    for update in updates {
-        updating_edges.update(update);
+    let mut updating_edges = (**edge_db).clone();
+    let mut flow_graph = flow_graph.lock().unwrap();
+    for update in &updates {
+        updating_edges.update(update.clone());
+        flow_graph.update_edge_capacity(&update.from, &update.to, &update.token, update.capacity);
     }
     let len = updating_edges.edge_count();
-    *edges.write().unwrap() = Arc::new(updating_edges);
+    *edge_db = Arc::new(updating_edges);
     Ok(len)
 }
 
@@ -347,4 +508,219 @@ fn chunked_response(data: &str) -> String {
 
 fn chunked_close() -> String {
     "0\r\n\r\n".to_string()
+}
+
+fn load_safes_and_convert_to_flow_graph(file: &str) -> Result<(Arc<FlowGraph>, Arc<EdgeDB>), Box<dyn Error>> {
+    let db = import_from_safes_binary(file)?;
+    let edge_db = Arc::new(db.edges().clone());
+    let flow_graph = Arc::new(edge_db_to_flow_graph(edge_db.clone(), &db));
+    Ok((flow_graph, edge_db))
+}
+
+fn edge_db_to_flow_graph(edge_db: Arc<EdgeDB>, db: &DB) -> FlowGraph {
+    let mut flow_graph = FlowGraph::new();
+    
+    // Set balances
+    for (address, safe) in db.safes() {
+        for (token, balance) in &safe.balances {
+            flow_graph.set_balance(*address, *token, *balance);
+        }
+    }
+
+    // Add edges and set trust limits
+    for edge in edge_db.edges() {
+        flow_graph.add_edge(edge.from, edge.to, edge.token, edge.capacity);
+        
+        // Set trust limit
+        let current_limit = flow_graph.get_trust_limit(&edge.from, &edge.to);
+        flow_graph.set_trust_limit(edge.from, edge.to, std::cmp::max(current_limit, edge.capacity));
+    }
+    
+    flow_graph
+}
+
+fn generic_compute_transfer_new<A: NetworkFlowAlgorithm + Clone>(
+    request: &JsonRpcRequest,
+    _edge_db: &EdgeDB,
+    flow_graph: &Arc<Mutex<FlowGraph>>,
+    mut socket: TcpStream,
+    algorithm: A,
+) -> Result<(), Box<dyn Error>> {
+    socket.write_all(chunked_header().as_bytes())?;
+
+    let parsed_value_param = match request.params["value"].as_str() {
+        Some(value_str) => validate_and_parse_u256(value_str)?,
+        None => U256::MAX,
+    };
+
+    let from_address = validate_and_parse_ethereum_address(&request.params["from"].to_string())?;
+    let to_address = validate_and_parse_ethereum_address(&request.params["to"].to_string())?;
+
+    let max_distances = if request.params["iterative"].as_bool().unwrap_or_default() {
+        vec![Some(1), Some(2), None]
+    } else {
+        vec![None]
+    };
+
+    let path_search_algorithm = match request.params["path_search_algorithm"].as_str().unwrap_or("BFS") {
+        "BFS" => PathSearchAlgorithm::BFS,
+        "BiBFS" => PathSearchAlgorithm::BiBFS,
+        _ => PathSearchAlgorithm::BFS, // Default to BFS if not specified or invalid
+    };
+
+    let flow_graph = flow_graph.lock().unwrap();
+    let network_flow = NetworkFlow::new((*flow_graph).clone());
+
+    for max_distance in max_distances {
+        let (flow, transfers) = network_flow.compute_flow(
+            algorithm.clone(),
+            &from_address,
+            &to_address,
+            parsed_value_param,
+            max_distance,
+            None,  // max_transfers
+            path_search_algorithm,
+            None
+        );
+        println!("Computed flow with max distance {max_distance:?}: {flow}");
+        socket.write_all(
+            chunked_response(
+                &(jsonrpc_result(
+                    request.id.clone(),
+                    json::object! {
+                        maxFlowValue: flow.to_decimal(),
+                        final: max_distance.is_none(),
+                        transferSteps: transfers.into_iter().map(|e| json::object! {
+                            from: e.from.to_checksummed_hex(),
+                            to: e.to.to_checksummed_hex(),
+                            token_owner: e.token.to_checksummed_hex(),
+                            value: e.capacity.to_decimal(),
+                        }).collect::<Vec<_>>(),
+                    },
+                ) + "\r\n"),
+            )
+            .as_bytes(),
+        )?;
+    }
+    socket.write_all(chunked_close().as_bytes())?;
+    Ok(())
+}
+
+type FlowComputationFn = fn(&Address, &Address, &EdgeDB, U256, Option<u64>, Option<u64>) -> (U256, Vec<Edge>);
+
+fn generic_visualize_flow_graph_new<A: NetworkFlowAlgorithm + Clone>(
+    edge_db: &EdgeDB,
+    flow_graph: &Arc<Mutex<FlowGraph>>,
+    params: &JsonValue,
+    algorithm: A,
+) -> Result<String, Box<dyn Error>> {
+    let visualizer = GraphVisualizer::new(edge_db.clone());
+
+    let from = Address::from(params["from"].as_str().unwrap());
+    let to = Address::from(params["to"].to_string().as_str());
+    let value = U256::from(params["value"].as_str().unwrap_or("0"));
+
+    let path_search_algorithm = match params["path_search_algorithm"].as_str().unwrap_or("BFS") {
+        "BFS" => PathSearchAlgorithm::BFS,
+        "BiBFS" => PathSearchAlgorithm::BiBFS,
+        _ => PathSearchAlgorithm::BFS, // Default to BFS if not specified or invalid
+    };
+
+    let flow_graph = flow_graph.lock().unwrap();
+    let network_flow = NetworkFlow::new((*flow_graph).clone());
+    let (_, flow) = network_flow.compute_flow(
+        algorithm,
+        &from,
+        &to,
+        value,
+        None,  // max_distance
+        None,   // max_transfers
+        path_search_algorithm,
+        None
+    );
+    
+    Ok(visualizer.generate_flow_graph(&flow))
+}
+
+fn generic_visualize_flow_graph(
+    edge_db: &Arc<EdgeDB>,
+    params: &JsonValue,
+    compute_fn: FlowComputationFn,
+) -> Result<String, Box<dyn Error>> {
+    let visualizer = GraphVisualizer::new((**edge_db).clone());
+
+    let from = Address::from(params["from"].as_str().unwrap());
+    let to = Address::from(params["to"].as_str().unwrap());
+    let value = U256::from(params["value"].as_str().unwrap_or("0"));
+
+    let (_, flow) = compute_fn(&from, &to, edge_db, value, None, None);
+    Ok(visualizer.generate_flow_graph(&flow))
+}
+
+fn compute_transfer_with_visualization<A: NetworkFlowAlgorithm + Clone>(
+    request: &JsonRpcRequest,
+    _edge_db: &EdgeDB,
+    flow_graph: &Arc<Mutex<FlowGraph>>,
+    mut socket: TcpStream,
+    algorithm: A,
+) -> Result<(), Box<dyn Error>> {
+    socket.write_all(chunked_header().as_bytes())?;
+
+    let parsed_value_param = match request.params["value"].as_str() {
+        Some(value_str) => validate_and_parse_u256(value_str)?,
+        None => U256::MAX,
+    };
+
+    let from_address = validate_and_parse_ethereum_address(&request.params["from"].to_string())?;
+    let to_address = validate_and_parse_ethereum_address(&request.params["to"].to_string())?;
+
+    let path_search_algorithm = match request.params["path_search_algorithm"].as_str().unwrap_or("BFS") {
+        "BFS" => PathSearchAlgorithm::BFS,
+        "BiBFS" => PathSearchAlgorithm::BiBFS,
+        _ => PathSearchAlgorithm::BFS,
+    };
+
+    let flow_graph = flow_graph.lock().unwrap();
+    let network_flow = NetworkFlow::new((*flow_graph).clone());
+
+    let mut recorder = FlowRecorder::new();
+
+    let (flow, transfers) = network_flow.compute_flow(
+        algorithm,
+        &from_address,
+        &to_address,
+        parsed_value_param,
+        None,  // max_distance
+        None,  // max_transfers
+        path_search_algorithm,
+        Some(&mut recorder)
+    );
+
+    println!("Computed flow: {flow}");
+
+    // Generate visualization
+    let visualization_path = format!("flow_visualization_{}.gif", chrono::Utc::now().timestamp());
+    recorder.generate_visualization(&visualization_path, from_address, to_address)?;
+
+    socket.write_all(
+        chunked_response(
+            &(jsonrpc_result(
+                request.id.clone(),
+                json::object! {
+                    maxFlowValue: flow.to_decimal(),
+                    transferSteps: transfers.into_iter().map(|e| json::object! {
+                        from: e.from.to_checksummed_hex(),
+                        to: e.to.to_checksummed_hex(),
+                        token_owner: e.token.to_checksummed_hex(),
+                        value: e.capacity.to_decimal(),
+                    }).collect::<Vec<_>>(),
+                    visualizationPath: visualization_path,
+                },
+            ) + "\r\n"),
+        )
+        .as_bytes(),
+    )?;
+
+    socket.write_all(chunked_close().as_bytes())?;
+    Ok(())
 }

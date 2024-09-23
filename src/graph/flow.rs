@@ -6,6 +6,7 @@ use std::cmp::min;
 use std::collections::{BTreeMap, HashSet};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write;
+//use std::time::Instant;
 
 pub fn compute_flow(
     source: &Address,
@@ -18,6 +19,11 @@ pub fn compute_flow(
     let mut adjacencies = Adjacencies::new(edges);
     let mut used_edges: HashMap<Node, HashMap<Node, U256>> = HashMap::new();
 
+    // Print capacities of the source node
+  //  println!("Capacities of the source node {}:", source);
+  //  for edge in edges.outgoing(source) {
+  //      println!("  To: {}, Token: {}, Capacity: {}", edge.to, edge.token, edge.capacity.to_decimal());
+  //  }
     let mut flow = U256::default();
     loop {
         let (new_flow, parents) = augmenting_path(source, sink, &mut adjacencies, max_distance);
@@ -25,6 +31,8 @@ pub fn compute_flow(
             break;
         }
         flow += new_flow;
+    //    println!("flow: {}", flow.to_decimal());
+       // let start = Instant::now();  
         for window in parents.windows(2) {
             if let [node, prev] = window {
                 adjacencies.adjust_capacity(prev, node, -new_flow);
@@ -46,6 +54,8 @@ pub fn compute_flow(
                 panic!();
             }
         }
+      //  let duration = start.elapsed();  // Get the elapsed time
+      //  println!("update_flow Time taken: {:?}", duration);
     }
 
     used_edges.retain(|_, out| {
@@ -78,6 +88,8 @@ pub fn compute_flow(
     let simplified_transfers = simplify_transfers(transfers);
     println!("After simplification: {}", simplified_transfers.len());
     let sorted_transfers = sort_transfers(simplified_transfers);
+    println!("After sorting: {:?}", sorted_transfers);
+    println!("After sorting Flow: {:?}", flow.to_decimal());
     (flow, sorted_transfers)
 }
 
@@ -126,6 +138,7 @@ fn augmenting_path(
     let mut queue = VecDeque::<(Node, (u64, U256))>::new();
     queue.push_back((Node::Node(*source), (0, U256::default() - U256::from(1))));
     while let Some((node, (depth, flow))) = queue.pop_front() {
+     //   println!("{} {} {}",node, depth, flow);
         if let Some(max) = max_distance {
             // * 3 because we have three edges per trust connection (two intermediate nodes).
             if depth >= max * 3 {
